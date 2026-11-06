@@ -7,6 +7,7 @@
 #include "ns3/uinteger.h"
 #include "ns3/double.h"
 #include "switch-node.h"
+#include "memop-header.h"
 #include "qbb-net-device.h"
 #include "ppp-header.h"
 #include "ns3/simulator.h"
@@ -60,7 +61,53 @@ SwitchNode::SwitchNode(){
 		m_u[i] = 0;
 }
 
+bool SwitchNode::ValidMemOpPort(uint32_t port) const {
+    return port < m_devices.size() && port < pCnt &&
+           DynamicCast<QbbNetDevice>(m_devices[port]) && m_devices[port]->IsLinkUp();
+}
+
+bool SwitchNode::BindGpuPort(uint32_t gpu, uint32_t port) {
+    if (!ValidMemOpPort(port)) return false;
+    m_gpuPorts[gpu] = port;
+    return true;
+}
+
+int SwitchNode::GetGpuPort(uint32_t gpu) const {
+    auto found = m_gpuPorts.find(gpu);
+    return found == m_gpuPorts.end() ? -1 : int(found->second);
+}
+
+bool SwitchNode::BindMemOpTransaction(uint64_t transaction, uint8_t opcode, uint32_t port) {
+    if (!ValidMemOpPort(port) || (opcode != MemOpHeader::READ && opcode != MemOpHeader::RESPONSE))
+        return false;
+    m_memOpRules[{transaction, opcode}] = port;
+    return true;
+}
+
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
+    // UDP port 9000 is reserved for this MemOp wire protocol when enabled.
+    // Other traffic and disabled mode retain the existing IP/ECMP behavior.
+    if (m_memOpEnabled && ch.l3Prot == 0x11 && ch.udp.dport == 9000) {
+        auto copy = p->Copy();
+        PppHeader ppp; Ipv4Header ip;
+        if (copy->GetSize() < ppp.GetSerializedSize() + 20) return -1;
+        copy->RemoveHeader(ppp); copy->RemoveHeader(ip);
+        uint32_t transportBytes = CustomHeader::GetUdpHeaderSize();
+        MemOpHeader op;
+        if (ip.GetFragmentOffset() != 0 || !ip.IsLastFragment() ||
+            copy->GetSize() < transportBytes + op.GetSerializedSize()) return -1;
+        copy->RemoveAtStart(transportBytes); copy->RemoveHeader(op);
+        if ((op.opcode != MemOpHeader::READ && op.opcode != MemOpHeader::RESPONSE) ||
+            op.size == 0 || copy->GetSize() != (op.opcode == MemOpHeader::READ ? 0 : op.size))
+            return -1;
+        auto rule = m_memOpRules.find({op.transaction, op.opcode});
+        int port = rule != m_memOpRules.end() ? int(rule->second) : GetGpuPort(op.dst);
+        if (port < 0 || !ValidMemOpPort(port)) return -1;
+        if (rule != m_memOpRules.end()) ++m_memOpRuleHits;
+        else ++m_memOpMapHits;
+        return port;
+    }
+
 	// look up entries
 	auto entry = m_rtTable.find(ch.dip);
 

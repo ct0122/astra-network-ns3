@@ -57,6 +57,7 @@ build_lib(
     model/rdma-hw.h
     model/rdma-queue-pair.h
     model/switch-mmu.h
+    model/memop-header.h
     model/switch-node.h
     model/trace-format.h
   LIBRARIES_TO_LINK ${libnetwork}

@@ -6,6 +6,16 @@ set(astra-sim-ns3-libs-list
   "libpoint-to-point"
   "libnetwork"
 )
+build_exec(
+  EXECNAME memop-read-smoke
+  SOURCE_FILES memop-read-smoke.cc
+  LIBRARIES_TO_LINK "${libapplications}" "${libinternet}" "${libpoint-to-point}"
+  EXECUTABLE_DIRECTORY_PATH "${PROJECT_SOURCE_DIR}/build/scratch/"
+)
+option(NS3_MEMOP_FABRIC_ONLY "Build the standalone fabric test without ASTRA dependencies" OFF)
+if(NS3_MEMOP_FABRIC_ONLY)
+  return()
+endif()
 list(JOIN astra-sim-ns3-libs-list " " astra-sim-ns3-libs)
 set(astra-sim-dir "${PROJECT_SOURCE_DIR}/../../../")
 include_directories("../scratch")

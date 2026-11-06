@@ -6,3 +6,6 @@
 !subdir/
 !scratch-simulator.cc
 !CMakeLists.txt
+!memop-read-smoke.cc
+!README-memop-read.md
+!run-memop-regressions.py

@@ -2,6 +2,7 @@
 #define SWITCH_NODE_H
 
 #include <unordered_map>
+#include <map>
 #include <ns3/node.h>
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
@@ -16,6 +17,12 @@ class SwitchNode : public Node{
 	static const uint32_t qCnt = 8;	// Number of queues/priorities used
 	uint32_t m_ecmpSeed;
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
+
+    bool m_memOpEnabled = false;
+    std::unordered_map<uint32_t, uint32_t> m_gpuPorts;
+    std::map<std::pair<uint64_t, uint8_t>, uint32_t> m_memOpRules;
+    uint64_t m_memOpRuleHits = 0, m_memOpMapHits = 0;
+    bool ValidMemOpPort(uint32_t port) const;
 
 	// monitor of PFC
 	uint32_t m_bytes[pCnt][pCnt][qCnt]; // m_bytes[inDev][outDev][qidx] is the bytes from inDev enqueued for outDev at qidx
@@ -47,6 +54,14 @@ public:
 	void SetEcmpSeed(uint32_t seed);
 	void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
 	void ClearTable();
+    // Ports are actual QBB interface indices, not logical GPU IDs.
+    void EnableMemOpForwarding(bool enabled) { m_memOpEnabled = enabled; }
+    bool BindGpuPort(uint32_t gpu, uint32_t port);
+    int GetGpuPort(uint32_t gpu) const;
+    bool BindMemOpTransaction(uint64_t transaction, uint8_t opcode, uint32_t port);
+    void ClearMemOpRules() { m_memOpRules.clear(); }
+    uint64_t GetMemOpRuleHits() const { return m_memOpRuleHits; }
+    uint64_t GetMemOpMapHits() const { return m_memOpMapHits; }
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
 
