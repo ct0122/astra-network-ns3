@@ -7,6 +7,9 @@
 #include "ns3/seq-ts-header.h"
 #include "ns3/ppp-header.h"
 #include "ns3/memop-header.h"
+#include "ns3/memop-network-adapter.h"
+#include <filesystem>
+#include <iomanip>
 
 #include <array>
 #include <fstream>
@@ -27,6 +30,8 @@ Time completed;
 int64_t minRttNs = INT64_MAX, maxRttNs = 0, totalRttNs = 0;
 bool dropResponse = false, m2 = false, m3 = false;
 Ptr<SwitchNode> fabric;
+std::string m4;
+uint32_t fanout = 4, readSize = 128, dropResponder = 0;
 struct Transaction {
     MemOpHeader request;
     Time issued;
@@ -51,6 +56,11 @@ uint8_t DataByte(const MemOpHeader& op, uint32_t offset)
 }
 
 Ipv4Address Ip(uint32_t gpu) { return Ipv4Address(0x0a000001 + gpu); }
+
+#include "memop-multicast.h"
+#include "memop-reduction.h"
+void Send(MemOpHeader op);
+#include "memop-evaluation.h"
 
 MemOpHeader Decode(Ptr<const Packet> wire, Ptr<Packet>& payload)
 {
@@ -87,7 +97,7 @@ void Send(MemOpHeader op)
     Ipv4Header ip; ip.SetSource(Ip(op.src)); ip.SetDestination(Ip(m3 ? (op.dst + 1) % 8 : op.dst));
     ip.SetProtocol(0x11); ip.SetTtl(64); ip.SetPayloadSize(p->GetSize()); p->AddHeader(ip);
     PppHeader ppp; ppp.SetProtocol(0x0021); p->AddHeader(ppp);
-    std::cout << Simulator::Now().GetNanoSeconds() << " ns SEND " << op << '\n';
+    if (!m6) std::cout << Simulator::Now().GetNanoSeconds() << " ns SEND " << op << '\n';
     // Use the NIC's existing control-packet injection queue, without an RDMA QP.
     // The switch still classifies the UDP packet into normal priority group 1.
     nics[op.src]->RdmaEnqueueHighPrioQ(p);
@@ -96,6 +106,9 @@ void Send(MemOpHeader op)
 
 int Receive(uint32_t gpu, Ptr<Packet> wire, CustomHeader&)
 {
+    if (m6) return M6Receive(gpu, wire);
+    if (!m5.empty()) return M5Receive(gpu, wire);
+    if (!m4.empty()) return M4Receive(gpu, wire);
     Ptr<Packet> payload;
     auto op = Decode(wire, payload);
     NS_ABORT_MSG_IF(gpu != (op.opcode == MemOpHeader::READ ? ServiceGpu(op) : op.dst),
@@ -133,6 +146,9 @@ int Receive(uint32_t gpu, Ptr<Packet> wire, CustomHeader&)
 
 void Forward(uint32_t gpu, Ptr<const Packet> wire, uint32_t queue)
 {
+    if (m6) { M6Dequeue(gpu, wire, queue); return; }
+    if (!m5.empty()) { M5Forward(gpu, wire, queue); return; }
+    if (!m4.empty()) { M4Forward(gpu, wire, queue); return; }
     Ptr<Packet> payload;
     auto op = Decode(wire, payload);
     NS_ABORT_MSG_IF((op.opcode == MemOpHeader::READ ? ServiceGpu(op) : op.dst) != gpu || queue != 1, "Wrong switch output port/queue");
@@ -153,6 +169,8 @@ void Forward(uint32_t gpu, Ptr<const Packet> wire, uint32_t queue)
 
 void Enqueue(Ptr<QbbNetDevice> dev, Ptr<const Packet> wire, uint32_t queue)
 {
+    if (m6) { M6Enqueue(dev, wire, queue); return; }
+    if (!m4.empty() || !m5.empty()) return;
     Ptr<Packet> payload; auto op = Decode(wire, payload);
     NS_ABORT_MSG_IF(queue != 1, "Unexpected queue");
     NS_ABORT_MSG_IF(!enqueued.emplace(std::make_pair(op.transaction, op.opcode),
@@ -171,6 +189,9 @@ void Issue(MemOpHeader op)
 
 void Start()
 {
+    if (m6) { M6Start(); return; }
+    if (!m5.empty()) { M5Start(); return; }
+    if (!m4.empty()) { M4Start(); return; }
     if (m3)
     {
         for (uint32_t gpu = 0; gpu < 8; ++gpu)
@@ -212,7 +233,28 @@ int main(int argc, char** argv)
     cmd.AddValue("dropResponse", "Negative control: suppress GPU7 response (expect FAIL)", dropResponse);
     cmd.AddValue("m2", "Run 64 concurrent variable-size transactions with hotspot contention", m2);
     cmd.AddValue("m3", "Test metadata forwarding and programmable bindings", m3);
+    cmd.AddValue("dropResponder", "M4 negative control: suppress one GPU response (0 disables)", dropResponder);
+    cmd.AddValue("m4", "M4 mode: unicast or multicast", m4);
+    cmd.AddValue("fanout", "M4 destinations GPU1..N (1..7)", fanout);
+    cmd.AddValue("readSize", "M4 response bytes per recipient (1..4096)", readSize);
+    cmd.AddValue("m5", "Reduction scenario: normal, missing, boundary, late-result, result-boundary, capacity", m5);
+    cmd.AddValue("m6", "Run the network READ adapter evaluation", m6);
+    cmd.AddValue("m6Count", "Number of accepted READs (1..4096)", m6Count);
+    cmd.AddValue("m6Window", "Global outstanding capacity (1..256)", m6Window);
+    cmd.AddValue("m6Period", "Minimum offered submission interval in ns (0 means burst)", m6Period);
+    cmd.AddValue("m6Size", "READ response bytes (1..4096)", m6Size);
+    cmd.AddValue("m6Timeout", "Per-request receipt deadline offset in ns", m6Timeout);
+    cmd.AddValue("m6Output", "Output directory for metrics CSVs", m6Output);
     cmd.Parse(argc, argv);
+    NS_ABORT_MSG_IF(m6 && (m2 || m3 || !m4.empty() || !m5.empty() || m6Count < 1 ||
+                    m6Count > 4096 || m6Window < 1 || m6Window > 256 || m6Size < 1 ||
+                    m6Size > 4096 || m6Period > 10000 || m6Timeout < 1 || m6Timeout > 1000000),
+                    "Invalid M6 options");
+    NS_ABORT_MSG_IF(!m5.empty() && (m2 || m3 || !m4.empty() ||
+        (m5 != "normal" && m5 != "missing" && m5 != "boundary" &&
+         m5 != "late-result" && m5 != "result-boundary" && m5 != "capacity")), "Invalid M5 mode");
+    NS_ABORT_MSG_IF(!m4.empty() && (m2 || m3 || (m4 != "unicast" && m4 != "multicast")
+                    || dropResponder > fanout || fanout < 1 || fanout > 7 || readSize < 1 || readSize > 4096), "Invalid M4 options");
     NS_ABORT_MSG_IF(m2 && m3, "Select one milestone");
     std::ifstream input(topology);
     uint32_t nodes = 0, switches = 0, links = 0, switchId = 0;
@@ -222,7 +264,7 @@ int main(int argc, char** argv)
     NodeContainer gpus; gpus.Create(8);
     Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
     fabric = sw;
-    sw->EnableMemOpForwarding(m3);
+    sw->EnableMemOpForwarding(m3 || !m4.empty() || !m5.empty() || m6);
     NodeContainer all(gpus); all.Add(sw);
     InternetStackHelper internet; internet.Install(all);
     sw->m_mmu->node_id = sw->GetId();
@@ -270,9 +312,37 @@ int main(int argc, char** argv)
         for (uint32_t gpu = 0; gpu < 8; ++gpu)
             NS_ABORT_MSG_IF(sw->GetGpuPort(gpu) != int(ports[gpu]), "GPU map changed");
     }
+    if (!m4.empty()) {
+        std::vector<uint32_t> members;
+        for (uint32_t gpu = 1; gpu <= fanout; ++gpu) members.push_back(gpu);
+        NS_ABORT_MSG_IF(!sw->BindMemOpMulticastGroup(100, members), "Group bind failed");
+        NS_ABORT_MSG_IF(sw->BindMemOpMulticastGroup(100, {}) ||
+                        sw->BindMemOpMulticastGroup(100, {1, 1}) ||
+                        sw->BindMemOpMulticastGroup(100, {999}), "Invalid group accepted");
+        for (uint32_t gpu = 0; gpu < 8; ++gpu)
+            NS_ABORT_MSG_IF(!nics[gpu]->TraceConnectWithoutContext("QbbDequeue",
+                            MakeBoundCallback(&M4NicTx, gpu)), "NIC observer failed");
+    }
+    if (!m5.empty())
+        for (auto nic : nics)
+            NS_ABORT_MSG_IF(!nic->TraceConnectWithoutContext("QbbDequeue", MakeCallback(&M5NicTx)),
+                            "Cannot observe reduction ingress");
+    if (m6) {
+        for (uint32_t gpu = 0; gpu < 8; ++gpu) {
+            NS_ABORT_MSG_IF(!nics[gpu]->TraceConnectWithoutContext("QbbDequeue",
+                MakeBoundCallback(&M6NicTx, gpu)), "M6 NIC observer failed");
+            NS_ABORT_MSG_IF(!nics[gpu]->TraceConnectWithoutContext("QbbEnqueue",
+                MakeBoundCallback(&M6NicEnqueue, gpu)), "M6 NIC queue observer failed");
+            m6Devices[gpu] = DynamicCast<QbbNetDevice>(sw->GetDevice(ports[gpu]));
+        }
+    }
     Simulator::Schedule(MicroSeconds(1), &Start);
-    Simulator::Stop(MilliSeconds(1));
+    Simulator::Stop(m6 ? NanoSeconds(1000 + uint64_t(m6Count) *
+        (m6Period + m6Timeout + 1) + 100000) : MilliSeconds(1));
     Simulator::Run();
+    if (m6) { bool passed = M6Finish(); Simulator::Destroy(); return passed ? 0 : 1; }
+    if (!m5.empty()) { bool passed = M5Finish(); Simulator::Destroy(); return passed ? 0 : 1; }
+    if (!m4.empty()) { bool passed = M4Finish(); Simulator::Destroy(); return passed ? 0 : 1; }
     uint32_t expected = m2 ? 64 : (m3 ? 8 : 1);
     bool passed = requests == expected && responses == expected && forwards == 2 * expected
                   && enqueued.empty() && transactions.size() == expected;

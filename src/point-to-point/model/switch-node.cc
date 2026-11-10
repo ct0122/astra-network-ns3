@@ -13,6 +13,7 @@
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
 #include <cmath>
+#include <algorithm>
 
 namespace ns3 {
 
@@ -84,22 +85,45 @@ bool SwitchNode::BindMemOpTransaction(uint64_t transaction, uint8_t opcode, uint
     return true;
 }
 
+bool SwitchNode::ParseMemOp(Ptr<const Packet> packet, MemOpHeader& op) const {
+    auto copy = packet->Copy();
+    PppHeader ppp; Ipv4Header ip;
+    if (copy->GetSize() < ppp.GetSerializedSize() + 20) return false;
+    copy->RemoveHeader(ppp); copy->RemoveHeader(ip);
+    auto transport = CustomHeader::GetUdpHeaderSize();
+    UdpHeader udp;
+    if (ip.GetProtocol() != 0x11 || copy->GetSize() < transport ||
+        copy->PeekHeader(udp) == 0 || udp.GetDestinationPort() != 9000) return false;
+    if (ip.GetFragmentOffset() != 0 || !ip.IsLastFragment() ||
+        copy->GetSize() < transport + op.GetSerializedSize()) return false;
+    copy->RemoveAtStart(transport); copy->RemoveHeader(op);
+    if (op.opcode != MemOpHeader::READ && op.opcode != MemOpHeader::RESPONSE &&
+        op.opcode != MemOpHeader::MULTICAST_READ && op.opcode != MemOpHeader::REDUCE_SUM_U64 &&
+        op.opcode != MemOpHeader::REDUCE_RESULT) return false;
+    return op.size > 0 && copy->GetSize() == ((op.opcode == MemOpHeader::RESPONSE || op.opcode == MemOpHeader::REDUCE_SUM_U64 ||
+           op.opcode == MemOpHeader::REDUCE_RESULT) ? op.size : 0);
+}
+
+bool SwitchNode::BindMemOpMulticastGroup(uint32_t group, const std::vector<uint32_t>& gpus) {
+    if (gpus.empty()) return false;
+    std::vector<uint32_t> uniquePorts;
+    for (auto gpu : gpus) {
+        int port = GetGpuPort(gpu);
+        if (port < 0 || !ValidMemOpPort(port) ||
+            std::find(uniquePorts.begin(), uniquePorts.end(), uint32_t(port)) != uniquePorts.end())
+            return false;
+        uniquePorts.push_back(port);
+    }
+    m_multicastGroups[group] = gpus;
+    return true;
+}
+
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
     // UDP port 9000 is reserved for this MemOp wire protocol when enabled.
     // Other traffic and disabled mode retain the existing IP/ECMP behavior.
     if (m_memOpEnabled && ch.l3Prot == 0x11 && ch.udp.dport == 9000) {
-        auto copy = p->Copy();
-        PppHeader ppp; Ipv4Header ip;
-        if (copy->GetSize() < ppp.GetSerializedSize() + 20) return -1;
-        copy->RemoveHeader(ppp); copy->RemoveHeader(ip);
-        uint32_t transportBytes = CustomHeader::GetUdpHeaderSize();
         MemOpHeader op;
-        if (ip.GetFragmentOffset() != 0 || !ip.IsLastFragment() ||
-            copy->GetSize() < transportBytes + op.GetSerializedSize()) return -1;
-        copy->RemoveAtStart(transportBytes); copy->RemoveHeader(op);
-        if ((op.opcode != MemOpHeader::READ && op.opcode != MemOpHeader::RESPONSE) ||
-            op.size == 0 || copy->GetSize() != (op.opcode == MemOpHeader::READ ? 0 : op.size))
-            return -1;
+        if (!ParseMemOp(p, op) || op.opcode == MemOpHeader::MULTICAST_READ) return -1;
         auto rule = m_memOpRules.find({op.transaction, op.opcode});
         int port = rule != m_memOpRules.end() ? int(rule->second) : GetGpuPort(op.dst);
         if (port < 0 || !ValidMemOpPort(port)) return -1;
@@ -151,8 +175,8 @@ void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
 	}
 }
 
-void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
-	int idx = GetOutDev(p, ch);
+void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch, int forcedPort){
+	int idx = forcedPort >= 0 ? forcedPort : GetOutDev(p, ch);
 	if (idx >= 0){
 		NS_ASSERT_MSG(m_devices[idx]->IsLinkUp(), "The routing table look up should return link that is up");
 
@@ -238,11 +262,44 @@ void SwitchNode::ClearTable(){
 
 // This function can only be called in switch mode
 bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch){
+    if (m_memOpEnabled && ch.l3Prot == 0x11 && ch.udp.dport == 9000) {
+        MemOpHeader op;
+        if (!ParseMemOp(packet, op)) { ++reductionRejected; return false; }
+        if (op.opcode == MemOpHeader::REDUCE_SUM_U64) {
+            HandleReduction(device, packet, ch, op); return true;
+        }
+        if (op.opcode == MemOpHeader::REDUCE_RESULT) { ++reductionRejected; return false; }
+        if (op.opcode == MemOpHeader::MULTICAST_READ) {
+            auto group = m_multicastGroups.find(op.dst);
+            if (group == m_multicastGroups.end()) return false;
+            // Validate the full group before any replication. Source reflection is disallowed.
+            std::vector<uint32_t> outputs;
+            for (auto gpu : group->second) {
+                int port = GetGpuPort(gpu);
+                if (gpu == op.src || port < 0 || !ValidMemOpPort(port) ||
+                    std::find(outputs.begin(), outputs.end(), uint32_t(port)) != outputs.end())
+                    return false;
+                outputs.push_back(port);
+            }
+            for (auto port : outputs) {
+                auto copy = packet->Copy();
+                auto header = ch;
+                SendToDev(copy, header, port);
+            }
+            return true;
+        }
+    }
+
 	SendToDev(packet, ch);
 	return true;
 }
 
 void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p){
+    if (m_memOpEnabled) {
+        MemOpHeader op;
+        if (ParseMemOp(p, op) && op.opcode == MemOpHeader::REDUCE_RESULT)
+            reductionResultBytes += p->GetSize();
+    }
 	FlowIdTag t;
 	p->PeekPacketTag(t);
 	if (qIndex != 0){

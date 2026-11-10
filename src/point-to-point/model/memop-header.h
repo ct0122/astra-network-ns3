@@ -5,7 +5,7 @@ namespace ns3 {
 class MemOpHeader : public Header
 {
 public:
-    enum : uint8_t { READ = 1, RESPONSE = 2 };
+    enum : uint8_t { READ = 1, RESPONSE = 2, MULTICAST_READ = 3, REDUCE_SUM_U64 = 4, REDUCE_RESULT = 5 };
     uint64_t transaction = 0, address = 0;
     uint32_t src = 0, dst = 0, size = 0;
     uint8_t opcode = READ;

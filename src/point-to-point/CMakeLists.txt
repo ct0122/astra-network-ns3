@@ -37,6 +37,7 @@ build_lib(
     model/rdma-queue-pair.cc
     model/switch-mmu.cc
     model/switch-node.cc
+    model/switch-reduction.cc
   HEADER_FILES
     ${mpi_headers}
     helper/point-to-point-helper.h
@@ -57,6 +58,7 @@ build_lib(
     model/rdma-hw.h
     model/rdma-queue-pair.h
     model/switch-mmu.h
+    model/memop-network-adapter.h
     model/memop-header.h
     model/switch-node.h
     model/trace-format.h

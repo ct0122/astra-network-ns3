@@ -9,3 +9,8 @@
 !memop-read-smoke.cc
 !README-memop-read.md
 !run-memop-regressions.py
+!memop-multicast.h
+!M5-operation-contract.md
+!memop-reduction.h
+!memop-evaluation.h
+!run-memop-evaluation.py
